@@ -55,7 +55,7 @@ from coreai_opt.quantization.spec.fake_quantize import (
     FakeQuantizeImplBase,
 )
 
-from ._prepare_for_export import prepare_for_mlir_export
+from ._prepare_for_export import move_cache_dequant_to_output, prepare_for_mlir_export
 from ._prepare_for_mil_export import prepare_for_mil_export
 from ._utils import remove_act_fq_from_reference_tracker, remove_fake_quant_modules
 from .supported_ops_registry import (
@@ -102,6 +102,17 @@ class EagerQuantizer(_BaseQuantizer, EagerCompressionComponentBuilderMixin):
             self._get_module_compression_components_and_priority(model, config)
         )
 
+        kv_cache_input_components = {
+            op: (
+                kc.quant_input_idx,
+                QuantizationComponentFactory.construct_partial(
+                    spec=kc.op_quantizer_config.op_input_spec[kc.quant_input_idx],
+                    target=CompressionTargetTensor.ACTIVATION,
+                ),
+            )
+            for op, kc in (config.kv_cache_quant_configs or {}).items()
+        }
+
         # TODO: Add a iterative eager handler and provide a flag to toggle
         self._handler = TorchFunctionEagerHandler(
             compression_config=config,
@@ -109,6 +120,7 @@ class EagerQuantizer(_BaseQuantizer, EagerCompressionComponentBuilderMixin):
             module_priority_dict=module_priority_dict,
             supported_ops_registry=EagerQuantizerSupportedOpsRegistry,
             optimization_type_name="quantize",
+            kv_cache_input_components=kv_cache_input_components,
         )
 
     @classmethod
@@ -204,6 +216,9 @@ class EagerQuantizer(_BaseQuantizer, EagerCompressionComponentBuilderMixin):
         ):
             self._model = self._handler.prepare(self._model, example_inputs=example_inputs)
 
+            # Catch KV cache misconfiguration (op type never called).
+            self._validate_kv_cache_quant_ops()
+
             self._postprocess_prepared_model(self._model)
 
             self._model.apply(enable_observer)
@@ -220,6 +235,19 @@ class EagerQuantizer(_BaseQuantizer, EagerCompressionComponentBuilderMixin):
 
         self._mark_model_as_prepared(self._model)
         return self._model
+
+    def _validate_kv_cache_quant_ops(self) -> None:
+        """Raise if a ``kv_cache_quant_configs`` key matched no op call during prepare.
+
+        Out-of-range ``op_input_spec`` keys are rejected earlier, at the op call itself.
+        """
+        seen_op_types = {r.op_type for r in self._handler.kv_cache_registrations}
+        for op in self._config.kv_cache_quant_configs or {}:
+            if op not in seen_op_types:
+                raise ValueError(
+                    f"kv_cache_quant_configs key {op!r} matches no op called by the model "
+                    "on the example inputs."
+                )
 
     @staticmethod
     def _postprocess_prepared_model(model: nn.Module) -> None:
@@ -279,11 +307,27 @@ class EagerQuantizer(_BaseQuantizer, EagerCompressionComponentBuilderMixin):
             case ExportBackend.Torch:
                 # Activation fake quantization lives in standalone modules, not
                 # parametrizations, so only weight fake quantization is folded.
+                # KV-cache quantization is a no-op here: the fake quantization on the
+                # cache op input stays.
                 fold_compression_parametrizations(model, FakeQuantizeImplBase)
                 finalized_model = model
             case ExportBackend.CoreAI:
                 finalized_model = prepare_for_mlir_export(model, mmap_dir=mmap_dir)
+                if self._handler.kv_cache_registrations:
+                    # Relocate each cache-update op's input dequantize to its output so
+                    # the cache stays in the quantized dtype.
+                    finalized_model = move_cache_dequant_to_output(
+                        finalized_model,
+                        self._handler.kv_cache_registrations,
+                        self._handler.act_handler.reference_tracker,
+                    )
             case ExportBackend.CoreML:
+                if self._config.kv_cache_quant_configs:
+                    raise NotImplementedError(
+                        "kv_cache_quant_configs is not supported with the CoreML "
+                        "backend; the finalize-side dequantize relocation only "
+                        "applies to the CoreAI backend."
+                    )
                 finalized_model = prepare_for_mil_export(model)
             case _:
                 msg = f"Unsupported backend {backend}"

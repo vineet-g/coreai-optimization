@@ -82,6 +82,10 @@ def get_func_base_name(func: Callable) -> str:
     """
     Return the function base name
     """
+    if isinstance(func, OpOverload):
+        # resolve_name returns "<namespace>.<op>.<overload>"; the op, not the overload
+        # (e.g. "default"), names the function.
+        return func._opname
     func_name = torch.overrides.resolve_name(func)
     if func_name is None:
         if not hasattr(func, "__name__"):

@@ -17,6 +17,7 @@ from typing import Any, Literal, NamedTuple
 import torch
 import torch.nn as nn
 import torch.nn.utils.parametrize as P
+from torch._ops import OpOverload, OpOverloadPacket
 from torch.overrides import TorchFunctionMode, _get_current_function_mode
 from torch.utils._pytree import tree_map
 
@@ -31,6 +32,7 @@ from .preregistration_tracker import PreregistrationTracker
 from .registered_optimizers_tracker import RegisteredOptimizersTracker
 from .state_spec_resolver import StateSpecResolver
 from .types import (
+    KVCacheOpRegistration,
     ModuleCompressionComponents,
     OpCompressionComponents,
     PendingOptimizerRegistration,
@@ -172,6 +174,7 @@ class RegisterEagerOptimizationMode(ScopedEagerOptimizationModeBase):
         module_priority_dict: Mapping[str, int],
         supported_ops_registry: type[BaseSupportedOpsRegistry],
         optimization_type_name: str = "optimize",
+        kv_cache_input_components: Mapping[str, tuple[int, PartialConstructor]] | None = None,
     ) -> None:
         super().__init__(
             model=model,
@@ -181,6 +184,10 @@ class RegisterEagerOptimizationMode(ScopedEagerOptimizationModeBase):
             optimization_type_name=optimization_type_name,
         )
         self.traversed_modules: set[nn.Module] = set()
+        # Maps a KV-cache update op type to the index of its tensor input to optimize
+        # and the optimizer constructor for it.
+        self.kv_cache_input_components = kv_cache_input_components or {}
+        self.kv_cache_registrations: list[KVCacheOpRegistration] = []
         self.state_resolver = StateSpecResolver(
             model=model,
             module_components_dict=module_components_dict,
@@ -320,6 +327,16 @@ class RegisterEagerOptimizationMode(ScopedEagerOptimizationModeBase):
                 for func_name, pending_records in module_funcs.items()
                 for record in pending_records
             ):
+                if self._get_kv_cache_op_type(pending_record.function) is not None:
+                    # KV-cache specs win over module-level specs, so skip resolution.
+                    self._register_resolved_optimizations(
+                        pending_record.pending_inputs,
+                        pending_record.pending_outputs,
+                        module_name,
+                        f_name,
+                    )
+                    continue
+
                 # Resolve pending input registrations
                 resolved_inputs = self._resolve_pending_registrations(
                     pending_record.function, pending_record.pending_inputs, boundary_type="input"
@@ -539,6 +556,101 @@ class RegisterEagerOptimizationMode(ScopedEagerOptimizationModeBase):
                 state_to_parametrize.optimizer,
                 unsafe=True,
             )
+
+    def _get_kv_cache_op_type(self, func: Callable) -> str | None:
+        """Return the op type of ``func`` if it is a configured KV-cache update op, else None."""
+        if not isinstance(func, (OpOverload, OpOverloadPacket)):
+            return None
+        op_type = get_func_base_name(func)
+        return op_type if op_type in self.kv_cache_input_components else None
+
+    def _preregister_kv_cache_op(
+        self, func: Callable, op_type: str, args: tuple, kwargs: dict, out: Any
+    ) -> None:
+        """Preregister the configured input optimizer of a KV-cache update op call.
+
+        Mirrors the graph-mode cache-op annotation override: only the configured input is
+        optimized; all other inputs, the output, and states are left alone, and module-level
+        specs are not applied. The input index counts the op's tensor arguments,
+        deduplicated, in schema order, which matches graph mode's ``node.all_input_nodes``.
+
+        Raises:
+            NotImplementedError: If the cache is held in a module parameter or buffer, or the
+                op does not return a single tensor.
+            ValueError: If the configured input index is out of range or the indexed input
+                is not a quantizable floating point tensor.
+        """
+        quant_input_idx, constructor = self.kv_cache_input_components[op_type]
+        func_base_name = get_func_base_name(func)
+        curr_func_count = self.preregistration_tracker.get_function_call_count(
+            self.current_module_name, func_base_name
+        )
+        func_name = get_func_name(func, curr_func_count)
+
+        if not isinstance(out, torch.Tensor):
+            raise NotImplementedError(
+                f"KV-cache op {func_name} in module {self.current_module_name!r} does not "
+                "return a single tensor. Multi-output cache ops are not supported."
+            )
+
+        # (identifier used in optimizer names, tensor) for each distinct tensor argument.
+        args, kwargs = normalize_args_kwargs(func, args, kwargs)
+        tensor_inputs: list[tuple[int | str, torch.Tensor]] = []
+        for arg_idx, (kwarg_name, value) in enumerate(
+            itertools.chain(((None, arg) for arg in args), kwargs.items())
+        ):
+            if not isinstance(value, torch.Tensor):
+                continue
+            if self.state_resolver.is_state_tensor(value) and is_optimizable_tensor(value):
+                raise NotImplementedError(
+                    f"KV-cache op {func_name} in module {self.current_module_name!r} reads "
+                    f"model state {self.state_resolver.get_all_local_names(value)} as argument "
+                    f"{arg_idx if kwarg_name is None else kwarg_name!r}. In eager mode the "
+                    "cache must be passed to the model as a forward input, not held in a "
+                    "module parameter or buffer."
+                )
+            if not any(value is tensor for _, tensor in tensor_inputs):
+                tensor_inputs.append((arg_idx if kwarg_name is None else kwarg_name, value))
+
+        if quant_input_idx >= len(tensor_inputs):
+            raise ValueError(
+                f"kv_cache_quant_configs[{op_type!r}].op_quantizer_config.op_input_spec key "
+                f"{quant_input_idx} is out of range for op {func_name} in module "
+                f"{self.current_module_name!r}, which has {len(tensor_inputs)} tensor inputs."
+            )
+        identifier, tensor = tensor_inputs[quant_input_idx]
+        if not is_optimizable_tensor(tensor):
+            raise ValueError(
+                f"kv_cache_quant_configs[{op_type!r}].op_quantizer_config.op_input_spec key "
+                f"{quant_input_idx} selects input {identifier!r} of op {func_name} in module "
+                f"{self.current_module_name!r}, which is not a quantizable floating point "
+                "tensor."
+            )
+
+        pending_input = PendingOptimizerRegistration(
+            self.current_module,
+            tensor_counter=self.module_boundary_tracker.get_or_assign_counter(tensor),
+            optimizer_name=self._build_optimizer_name(
+                func_name, self.optimization_type_name, identifier
+            ),
+            optimizer=constructor(op_to_optimize=func),
+        )
+        self.preregistration_tracker.record_function_call(
+            self.current_module_name, func_base_name, func, [pending_input], []
+        )
+        self.kv_cache_registrations.append(
+            KVCacheOpRegistration(
+                module_name=self.current_module_name,
+                op_type=op_type,
+                call_index=curr_func_count,
+                input_optimizer_name=pending_input.optimizer_name,
+                # Matches the name ActivationEagerOptimizationHandler looks up for the
+                # op's single output.
+                output_optimizer_name=self._build_optimizer_name(
+                    func_name, self.optimization_type_name, "output", 0
+                ),
+            )
+        )
 
     def _preregister_input_and_state_optimization(
         self,
@@ -777,6 +889,12 @@ class RegisterEagerOptimizationMode(ScopedEagerOptimizationModeBase):
             NamedModule(self.current_module_name, self.current_module)
         )
         out = func(*args, **kwargs)
+
+        kv_cache_op_type = self._get_kv_cache_op_type(func)
+        if kv_cache_op_type is not None:
+            if not already_traversed_module:
+                self._preregister_kv_cache_op(func, kv_cache_op_type, args, kwargs, out)
+            return out
 
         # We should process the function if
         # 1. There is a module level spec in play and the function is any which we can intercept, or

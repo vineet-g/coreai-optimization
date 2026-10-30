@@ -215,6 +215,21 @@ class FunctionRegisteredOptimizers:
     output_optimizer_names: list[str]
 
 
+@dataclass(frozen=True)
+class KVCacheOpRegistration:
+    """
+    Record of the optimizer registered on one KV-cache update op call.
+
+    Used at finalize time to relocate the dequantize from the op's input to its output.
+    """
+
+    module_name: str
+    op_type: str
+    call_index: int
+    input_optimizer_name: str
+    output_optimizer_name: str
+
+
 ActHandlerOutput = namedtuple(
     "ActHandlerOutput",
     ["args", "kwargs", "name_prefix", "args_to_optimize", "kwargs_to_optimize"],

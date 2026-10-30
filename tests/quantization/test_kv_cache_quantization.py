@@ -19,6 +19,7 @@ import torch.nn as nn
 from pydantic import ValidationError
 
 from coreai_opt import ExportBackend
+from coreai_opt._utils.insertion.torch_function.utils import get_func_base_name
 from coreai_opt.config.spec import CompressionTargetTensor
 from coreai_opt.quantization import (
     ModuleQuantizerConfig,
@@ -79,6 +80,31 @@ def _test_value_cache_update(
 @_test_value_cache_update.register_fake
 def _(x, update, begin, end, layer_idx, seq_len):
     return torch.empty((1, x.shape[2], seq_len, x.shape[4]), dtype=x.dtype)
+
+
+@torch.library.custom_op("coreai_opt_test_kv_cache::int_first_cache_update", mutates_args=["x"])
+def _test_int_first_cache_update(
+    x: torch.Tensor, layer_idx: int, update: torch.Tensor
+) -> torch.Tensor:
+    return x.narrow(0, layer_idx, 1).squeeze(0).clone()
+
+
+@_test_int_first_cache_update.register_fake
+def _(x, layer_idx, update):
+    return torch.empty(x.shape[1:], dtype=x.dtype)
+
+
+class _IntFirstCacheModel(nn.Module):
+    """Cache op whose int argument precedes the update tensor in the schema."""
+
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(8, 8)
+
+    def forward(self, cache: torch.Tensor, update: torch.Tensor) -> torch.Tensor:
+        return torch.ops.coreai_opt_test_kv_cache.int_first_cache_update(
+            cache, 0, self.proj(update)
+        )
 
 
 class _KVCacheAttentionModel(nn.Module):
@@ -266,20 +292,6 @@ class TestKVCacheQuantization:
                     op_output_spec=op_output_spec,
                     op_state_spec=op_state_spec,
                 ),
-            )
-
-    def test_kv_cache_quant_rejected_in_eager_mode(self):
-        """``kv_cache_quant_configs`` is graph-mode only; constructing a
-        ``QuantizerConfig`` with eager mode and any cache config must raise.
-        """
-        with pytest.raises(ValidationError, match="only supported with ExecutionMode.GRAPH"):
-            _build_quantizer_config(
-                execution_mode="eager",
-                kv_cache_quant_configs={
-                    "key_cache_update": _default_cache_config(
-                        default_activation_quantization_spec()
-                    ),
-                },
             )
 
     def test_prepare_does_not_mutate_global_pattern_registry(self):
@@ -593,3 +605,189 @@ class TestKVCacheQuantization:
                 f"{op_short_name}'s cache-state input should not be observed; "
                 f"got {cache_input.op}/{cache_input.target}"
             )
+
+
+class _BufferCacheModel(nn.Module):
+    """Cache op reading the cache from a module buffer instead of a forward input."""
+
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("k_cache", torch.zeros(2, 1, 8, 16, 32))
+        self.k_proj = nn.Linear(8, 32)
+
+    def forward(self, k_new: torch.Tensor) -> torch.Tensor:
+        begin = torch.zeros(5, dtype=torch.int32)
+        end = torch.zeros(5, dtype=torch.int32)
+        return torch.ops.coreai_opt_test_kv_cache.key_cache_update(
+            self.k_cache, self.k_proj(k_new).unsqueeze(0), begin, end, 0, 4
+        )
+
+
+def _get_activation_fake_quantizers(model: nn.Module) -> dict[str, FakeQuantizeImplBase]:
+    return {
+        name: m
+        for name, m in model.named_modules()
+        if isinstance(m, FakeQuantizeImplBase)
+        and m.quantization_target == CompressionTargetTensor.ACTIVATION
+    }
+
+
+@pytest.mark.parametrize("execution_mode", ["graph", "eager"])
+def test_quant_input_idx_counts_only_tensor_inputs(execution_mode):
+    """``op_input_spec``'s int key indexes the cache op's tensor inputs in both modes, so the
+    same config selects the same input even when a non-tensor argument precedes it.
+    """
+    config = _build_quantizer_config(
+        execution_mode=execution_mode,
+        kv_cache_quant_configs={
+            "int_first_cache_update": _default_cache_config(_make_act_spec(torch.int8)),
+        },
+    )
+    example_inputs = (torch.zeros(2, 8, 16, 32), torch.randn(8, 16, 8))
+    prepared = Quantizer(_IntFirstCacheModel().eval(), config).prepare(example_inputs)
+
+    if execution_mode == "graph":
+        cache_op = _get_single_cache_op_node(prepared, "int_first_cache_update")
+        observer = prepared.get_submodule(str(cache_op.all_input_nodes[1].target))
+    else:
+        act_fqs = _get_activation_fake_quantizers(prepared)
+        assert set(act_fqs) == {"int_first_cache_update_quantize_update"}
+        observer = act_fqs["int_first_cache_update_quantize_update"]
+    assert observer.dtype == torch.int8
+
+
+class TestEagerKVCacheQuantization:
+    @staticmethod
+    def _build_config(kv_cache_quant_configs, **kwargs) -> QuantizerConfig:
+        return QuantizerConfig(
+            execution_mode="eager",
+            global_config=ModuleQuantizerConfig(
+                op_state_spec={"weight": default_weight_quantization_spec()},
+                op_input_spec=None,
+                op_output_spec=None,
+            ),
+            kv_cache_quant_configs=kv_cache_quant_configs,
+            **kwargs,
+        )
+
+    def test_get_func_base_name_uses_op_name_for_op_overload(self):
+        """An ``OpOverload`` is named by its op, not its overload (e.g. ``default``), so both
+        call styles of a cache op resolve to the configured op type.
+        """
+        packet = torch.ops.coreai_opt_test_kv_cache.key_cache_update
+        assert get_func_base_name(packet) == "key_cache_update"
+        assert get_func_base_name(packet.default) == "key_cache_update"
+
+    def test_kv_cache_lifecycle(self):
+        """End-to-end prepare → calibrate → finalize with key=int8 and value=uint8. After
+        finalize the model runs on quantized caches and exports to
+        ``quantize -> cache_op -> dequantize`` with the cache placeholder in the quantized dtype.
+        """
+        op_specs = {
+            "key_cache_update": _make_act_spec(torch.int8),
+            "value_cache_update": _make_act_spec(torch.uint8, qscheme="asymmetric"),
+        }
+        config = self._build_config(
+            {op: _default_cache_config(spec) for op, spec in op_specs.items()}
+        )
+        example_inputs = _kv_cache_attention_example_inputs()
+        quantizer = Quantizer(_AttentionModel().eval(), config)
+
+        prepared = quantizer.prepare(example_inputs)
+
+        # Only the update input of each cache op is fake quantized, per-op dtype.
+        act_fqs = _get_activation_fake_quantizers(prepared)
+        assert set(act_fqs) == {f"attn.{op}_quantize_update" for op in op_specs}
+        for op, spec in op_specs.items():
+            assert act_fqs[f"attn.{op}_quantize_update"].dtype == spec.dtype
+
+        with quantizer.calibration_mode():
+            prepared(*example_inputs)
+
+        finalized = quantizer.finalize(backend=ExportBackend.CoreAI)
+        k_cache, v_cache, *rest = example_inputs
+        quantized_inputs = (
+            k_cache.to(op_specs["key_cache_update"].dtype),
+            v_cache.to(op_specs["value_cache_update"].dtype),
+            *rest,
+        )
+        assert finalized(*quantized_inputs).dtype == torch.float32
+
+        exported = torch.export.export(finalized, quantized_inputs).graph_module
+        for op, spec in op_specs.items():
+            cache_op = _get_single_cache_op_node(exported, op)
+            assert cache_op.args[1].target is torch.ops.coreai.quantize.default
+            users = list(cache_op.users)
+            assert len(users) == 1
+            assert users[0].target is torch.ops.coreai.dequantize.default
+            cache_placeholder = cache_op.args[0]
+            assert cache_placeholder.op == "placeholder"
+            assert cache_placeholder.meta["val"].dtype == spec.dtype
+
+    def test_kv_cache_spec_wins_over_module_level_spec(self):
+        """A module-level input spec on ``attn`` covering the cache op's inputs must not
+        override the cache spec, and must not quantize the cache-state input.
+        """
+        config = self._build_config(
+            {op: _default_cache_config(_make_act_spec(torch.int8)) for op in _CACHE_OP_NAMES},
+            module_name_configs={
+                "attn": ModuleQuantizerConfig(
+                    module_input_spec={"*": _make_act_spec(torch.float8_e4m3fn)},
+                ),
+            },
+        )
+        prepared = Quantizer(_AttentionModel().eval(), config).prepare(
+            _kv_cache_attention_example_inputs()
+        )
+
+        act_fqs = _get_activation_fake_quantizers(prepared)
+        cache_op_fqs = {
+            name: fq
+            for name, fq in act_fqs.items()
+            if any(f"attn.{op}_" in name for op in _CACHE_OP_NAMES)
+        }
+        assert set(cache_op_fqs) == {f"attn.{op}_quantize_update" for op in _CACHE_OP_NAMES}
+        for fq in cache_op_fqs.values():
+            assert fq.dtype == torch.int8
+
+    def test_prepare_rejects_out_of_range_quant_input_idx(self):
+        config = self._build_config(
+            {
+                "key_cache_update": KVCacheQuantConfig(
+                    op_quantizer_config=OpQuantizerConfig(
+                        op_input_spec={99: default_activation_quantization_spec()},
+                        op_output_spec=None,
+                        op_state_spec=None,
+                    ),
+                ),
+            }
+        )
+        with pytest.raises(ValueError, match=r"(?s)kv_cache_quant_configs.*op_input_spec.*99"):
+            Quantizer(_AttentionModel().eval(), config).prepare(
+                _kv_cache_attention_example_inputs()
+            )
+
+    def test_prepare_rejects_uncalled_op_type(self):
+        config = self._build_config(
+            {"not_a_cache_op": _default_cache_config(default_activation_quantization_spec())}
+        )
+        with pytest.raises(ValueError, match="'not_a_cache_op' matches no op"):
+            Quantizer(_AttentionModel().eval(), config).prepare(
+                _kv_cache_attention_example_inputs()
+            )
+
+    def test_prepare_rejects_cache_held_in_buffer(self):
+        config = self._build_config(
+            {"key_cache_update": _default_cache_config(default_activation_quantization_spec())}
+        )
+        with pytest.raises(NotImplementedError, match=r"\['k_cache'\]"):
+            Quantizer(_BufferCacheModel().eval(), config).prepare((torch.randn(1, 8, 4, 8),))
+
+    def test_coreml_backend_rejected(self):
+        config = self._build_config(
+            {"key_cache_update": _default_cache_config(default_activation_quantization_spec())}
+        )
+        quantizer = Quantizer(_AttentionModel().eval(), config)
+        quantizer.prepare(_kv_cache_attention_example_inputs())
+        with pytest.raises(NotImplementedError, match="CoreML"):
+            quantizer.finalize(backend=ExportBackend.CoreML)

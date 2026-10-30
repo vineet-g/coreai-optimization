@@ -11,6 +11,7 @@ from typing import Any
 import torch.nn as nn
 import torch.nn.utils.parametrize as P
 
+from coreai_opt._utils.spec_utils import PartialConstructor
 from coreai_opt._utils.torch_utils import NamedModule
 from coreai_opt.config import CompressionConfig
 from coreai_opt.config.spec import CompressionSimulatorBase
@@ -20,7 +21,7 @@ from .modes import (
     ActivationEagerOptimizationHandler,
     RegisterEagerOptimizationMode,
 )
-from .types import ModuleCompressionComponents
+from .types import KVCacheOpRegistration, ModuleCompressionComponents
 
 
 def _record_tensor_fqns(model: nn.Module) -> None:
@@ -51,14 +52,18 @@ class TorchFunctionEagerHandler:
         module_priority_dict: Mapping[str, int],
         supported_ops_registry: type[BaseSupportedOpsRegistry],
         optimization_type_name: str = "optimize",
+        kv_cache_input_components: Mapping[str, tuple[int, PartialConstructor]] | None = None,
     ):
         self.compression_config = compression_config
         self.module_components_dict = module_components_dict
         self.module_priority_dict = module_priority_dict
         self.supported_ops_registry = supported_ops_registry
         self.optimization_type_name = optimization_type_name
+        self.kv_cache_input_components = kv_cache_input_components or {}
         # Will be ActivationEagerOptimizationHandler
         self.act_handler: Any | None = None
+        # Populated by prepare(), one entry per optimized KV-cache update op call.
+        self.kv_cache_registrations: list[KVCacheOpRegistration] = []
 
     def prepare(self, model: nn.Module, example_inputs: tuple[Any, ...]) -> nn.Module:
         """
@@ -73,6 +78,7 @@ class TorchFunctionEagerHandler:
             self.module_priority_dict,
             self.supported_ops_registry,
             self.optimization_type_name,
+            self.kv_cache_input_components,
         ) as register_optimization_mode:
             model(*example_inputs)
 
@@ -86,8 +92,11 @@ class TorchFunctionEagerHandler:
         register_optimization_mode.register_all_states()
 
         _record_tensor_fqns(model)
+        self.kv_cache_registrations = register_optimization_mode.kv_cache_registrations
 
-        if self._is_weight_only_optimization(self.module_components_dict):
+        if not self.kv_cache_registrations and self._is_weight_only_optimization(
+            self.module_components_dict
+        ):
             return model
 
         # Init manager for optimization of inputs/activations

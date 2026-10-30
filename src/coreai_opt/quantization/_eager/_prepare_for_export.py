@@ -5,6 +5,7 @@
 
 import logging
 from collections import OrderedDict
+from collections.abc import Iterable
 from os import PathLike
 from pathlib import Path
 
@@ -14,6 +15,10 @@ import torch.nn.utils.parametrize as P
 
 from coreai_opt._utils.export_utils import clear_parametrization_original, prepare_mmap_dir
 from coreai_opt._utils.import_utils import lazy_import_coreai_torch
+from coreai_opt._utils.insertion.torch_function.registered_optimizers_tracker import (
+    RegisteredOptimizersTracker,
+)
+from coreai_opt._utils.insertion.torch_function.types import KVCacheOpRegistration
 from coreai_opt._utils.torch_utils import (
     get_parent_module_and_attr_name,
     is_float4_dtype,
@@ -311,4 +316,65 @@ def prepare_for_mlir_export(
     # Replace FakeQuantize modules with MLIR quantize dequantize modules
     _process_activation_quantization(model)
 
+    return model
+
+
+def move_cache_dequant_to_output(
+    model: nn.Module,
+    registrations: Iterable[KVCacheOpRegistration],
+    reference_tracker: RegisteredOptimizersTracker,
+) -> nn.Module:
+    """Relocate the dequantize on each KV-cache update op's input to the op's output.
+
+    Run after :func:`prepare_for_mlir_export`, which replaced each activation fake
+    quantization module with a ``quantize`` -> ``dequantize`` sequence. For each
+    registration, the input optimizer becomes the ``quantize`` module alone and the
+    ``dequantize`` module is registered as the op's output optimizer, so that
+
+        update -> quantize -> dequantize -> cache_op(x, dq, ...) -> consumer
+
+    runs as
+
+        update -> quantize -> cache_op(x, q, ...) -> dequantize -> consumer
+
+    The cache passed to the finalized model must therefore have the quantized dtype.
+
+    Precondition: the cache op must commute with quantize/dequantize — i.e. a pure
+    data-movement op (slicing, narrowing, copy) that accepts the quantized dtype.
+
+    Args:
+        model (nn.Module): Model already processed by :func:`prepare_for_mlir_export`.
+        registrations (Iterable[KVCacheOpRegistration]): The KV-cache op calls whose
+            input was optimized during prepare.
+        reference_tracker (RegisteredOptimizersTracker): The activation handler's reference
+            tracker, updated so the new output optimizer is applied at runtime.
+
+    Returns:
+        nn.Module: The mutated model.
+
+    Raises:
+        RuntimeError: If the expected ``quantize`` -> ``dequantize`` sequence is not present
+            on a registration's input.
+    """
+    for registration in registrations:
+        module = model.get_submodule(registration.module_name)
+        qdq = getattr(module, registration.input_optimizer_name, None)
+        if not (
+            isinstance(qdq, nn.Sequential)
+            and hasattr(qdq, "quantize")
+            and hasattr(qdq, "dequantize")
+        ):
+            raise RuntimeError(
+                f"Expected a quantize -> dequantize sequence at "
+                f"{registration.module_name!r}.{registration.input_optimizer_name}, "
+                f"found {type(qdq).__name__}."
+            )
+        setattr(module, registration.input_optimizer_name, qdq.quantize)
+        module.register_module(registration.output_optimizer_name, qdq.dequantize)
+        reference_tracker.set_output_optimizer_names(
+            registration.module_name,
+            registration.op_type,
+            registration.call_index,
+            [registration.output_optimizer_name],
+        )
     return model

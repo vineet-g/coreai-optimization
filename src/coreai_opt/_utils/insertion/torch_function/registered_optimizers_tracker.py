@@ -181,6 +181,23 @@ class RegisteredOptimizersTracker:
                 for record in self._registered[module_name][func_name]
             ]
 
+    def set_output_optimizer_names(
+        self, module_name: str, func_name: str, call_index: int, output_names: list[str]
+    ) -> None:
+        """Replace the output optimizer names recorded for one function call.
+
+        Args:
+            module_name (str): Fully qualified name of the module.
+            func_name (str): Base name of the function.
+            call_index (int): Index of the call among the function's calls in the module.
+            output_names (list[str]): New output optimizer names for the call.
+
+        """
+        records = self.get_module_registrations(module_name)[func_name]
+        records[call_index] = FunctionRegisteredOptimizers(
+            records[call_index].input_optimizer_names, output_names
+        )
+
     def validate_against_reference(
         self, reference_tracker: RegisteredOptimizersTracker, module_name: str
     ) -> None:

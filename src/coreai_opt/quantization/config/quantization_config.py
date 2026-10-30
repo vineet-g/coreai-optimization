@@ -479,10 +479,15 @@ class KVCacheQuantConfig(BaseModel):
     config-construction time when explicit ``op_type_config[op]`` collisions
     are detected. See :meth:`QuantizerConfig._validate_kv_cache_quant_configs`.
 
+    Supported in both graph and eager mode. In eager mode the cache must be passed to
+    the model as a forward input rather than held in a module buffer or parameter, and
+    the cache op must return a single tensor.
+
     Attributes:
         op_quantizer_config: ``OpQuantizerConfig`` whose ``op_input_spec`` selects the
             input edge to quantize. The int key indexes the op's tensor-valued,
-            deduplicated inputs (``node.all_input_nodes``). ``op_input_spec`` must
+            deduplicated inputs (``node.all_input_nodes`` in graph mode; the same
+            tensor arguments, in schema order, in eager mode). ``op_input_spec`` must
             contain exactly one key (no ``"*"``, no multi-key dicts) because the
             finalize-side relocation needs a single, unambiguous input edge to act on.
             ``op_output_spec`` and ``op_state_spec`` must be explicitly set to None
@@ -627,9 +632,7 @@ class QuantizerConfig(CompressionConfig[ModuleQuantizerConfig]):
             storing the corresponding KV-cache buffer in a quantized dtype: it
             carries the op's ``OpQuantizerConfig`` inline and triggers a finalize-side
             rewrite that relocates the dequantize from the op's input to its
-            output. Graph mode only; rejected for eager mode by
-            :meth:`_validate_kv_cache_quant_configs`. See
-            :class:`KVCacheQuantConfig` for details.
+            output. See :class:`KVCacheQuantConfig` for details.
             Default: None (no KV-cache buffer quantization)
 
     Example:
@@ -700,7 +703,7 @@ class QuantizerConfig(CompressionConfig[ModuleQuantizerConfig]):
 
     @model_validator(mode="after")
     def _validate_kv_cache_quant_configs(self) -> Self:
-        """Enforce graph-mode-only and warn on duplicate ``op_type_config[op]`` entries.
+        """Warn on duplicate ``op_type_config[op]`` entries.
 
         Each cache op's spec is carried inline by ``kv_cache_quant_configs[op]``. If the
         same op key also appears under any ``op_type_config`` (in ``global_config``,
@@ -711,12 +714,6 @@ class QuantizerConfig(CompressionConfig[ModuleQuantizerConfig]):
         """
         if not self.kv_cache_quant_configs:
             return self
-
-        if self.execution_mode != ExecutionMode.GRAPH:
-            raise ValueError(
-                f"kv_cache_quant_configs is only supported with "
-                f"ExecutionMode.GRAPH (got {self.execution_mode!r})."
-            )
 
         for op in self.kv_cache_quant_configs:
             warnings_list: list[str] = []
